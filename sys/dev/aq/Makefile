@@ -1,8 +1,7 @@
-.PATH: /home/ec2-user/data/bsd/freebsd-src/sys/dev/aq
+.PATH: /home/awatkins/bsd/freebsd-src/sys/dev/aq
 
 SRCS=if_aq.c
 KMOD=if_aq
-
-CFLAGS += -I/usr/obj/home/ec2-user/data/bsd/freebsd-src/amd64.amd64/sys/GENERIC
+SRCS+=	device_if.h bus_if.h pci_if.h 
 
 .include <bsd.kmod.mk>
