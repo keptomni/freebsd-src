@@ -62,7 +62,6 @@
  */
 
 #include <sys/cdefs.h>
-__KERNEL_RCSID(0, "$NetBSD: if_aq.c,v 1.50 2025/02/26 04:49:46 andvar Exp $");
 
 #ifdef _KERNEL_OPT
 #include "opt_if_aq.h"
@@ -71,24 +70,28 @@ __KERNEL_RCSID(0, "$NetBSD: if_aq.c,v 1.50 2025/02/26 04:49:46 andvar Exp $");
 
 #include <sys/param.h>
 #include <sys/types.h>
-#include <sys/bitops.h>
-#include <sys/cprng.h>
+#include <sys/bus.h>
+#include <sys/bus_dma.h>
 #include <sys/cpu.h>
 #include <sys/interrupt.h>
+#include <sys/callout.h>
 #include <sys/module.h>
-#include <sys/pcq.h>
+#include <sys/mbuf.h>
+#include <sys/mutex.h>
+#include <sys/socket.h>
+#include "sys/bitops.h"
+#include "sys/cprng.h"
+#include "sys/pcq.h"
 
 #include <net/bpf.h>
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <net/if_media.h>
-#include <net/if_ether.h>
+#include <net/ethernet.h>
 #include <net/rss_config.h>
 
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pcireg.h>
-#include <dev/pci/pcidevs.h>
-#include <dev/sysmon/sysmonvar.h>
 
 /* driver configuration */
 #define CONFIG_INTR_MODERATION_ENABLE	true	/* delayed interrupt */
@@ -119,6 +122,52 @@ __KERNEL_RCSID(0, "$NetBSD: if_aq.c,v 1.50 2025/02/26 04:49:46 andvar Exp $");
 #define AQ1_JUMBO_MTU_REV_A		9000
 #define AQ1_JUMBO_MTU_REV_B		16338
 #define AQ2_JUMBO_MTU			16338
+
+// Define NSYSMON_ENVSYS as 0 to disable NetBSD's environmental sensor monitoring
+// This is required when building outside of NetBSD to avoid related compile-time checks
+#define NSYSMON_ENVSYS 0
+
+// Define __BIT(n) as a macro that sets the nth bit (e.g., __BIT(3) == 0b1000)
+// Only define it if it's not already defined (for portability across BSDs)
+#ifndef __BIT
+#define __BIT(n) (1UL << (n))
+#endif
+
+/*
+ * Manually defined PCI vendor and product IDs for Aquantia (Marvell) NICs.
+ * These are required for support of newer chipsets not yet present in FreeBSD's pcidevs.
+ * Source: Linux driver aq_drv.h / Marvell datasheets.
+ *
+ * PCI_VENDOR_AQUANTIA: 0x1D6A
+ * Product IDs include AQC100, AQC107, AQC108, AQC109, AQC113, etc.
+ * Ensure these match hardware specifications to avoid misidentification.
+ */
+#define PCI_VENDOR_AQUANTIA              0x1D6A
+
+#define PCI_PRODUCT_AQUANTIA_AQC100      0x07B1
+#define PCI_PRODUCT_AQUANTIA_AQC107      0x07B1
+#define PCI_PRODUCT_AQUANTIA_AQC108      0x07B2
+#define PCI_PRODUCT_AQUANTIA_AQC109      0x07B3
+#define PCI_PRODUCT_AQUANTIA_AQC111      0x07B4
+#define PCI_PRODUCT_AQUANTIA_AQC112      0x07B5
+#define PCI_PRODUCT_AQUANTIA_AQC100S     0x07B6
+#define PCI_PRODUCT_AQUANTIA_AQC107S     0x07B7
+#define PCI_PRODUCT_AQUANTIA_AQC108S     0x07B8
+#define PCI_PRODUCT_AQUANTIA_AQC109S     0x07B9
+#define PCI_PRODUCT_AQUANTIA_AQC111S     0x07BA
+#define PCI_PRODUCT_AQUANTIA_AQC112S     0x07BB
+#define PCI_PRODUCT_AQUANTIA_D100        0x07BC
+#define PCI_PRODUCT_AQUANTIA_D107        0x07BD
+#define PCI_PRODUCT_AQUANTIA_D108        0x07BE
+#define PCI_PRODUCT_AQUANTIA_D109        0x07BF
+#define PCI_PRODUCT_AQUANTIA_AQC113DEV   0x00F1
+#define PCI_PRODUCT_AQUANTIA_AQC113      0x00F2
+#define PCI_PRODUCT_AQUANTIA_AQC113C     0x00F3
+#define PCI_PRODUCT_AQUANTIA_AQC113CA    0x00F4
+#define PCI_PRODUCT_AQUANTIA_AQC113CS    0x00F5
+#define PCI_PRODUCT_AQUANTIA_AQC114CS    0x00F6
+#define PCI_PRODUCT_AQUANTIA_AQC115C     0x00F7
+#define PCI_PRODUCT_AQUANTIA_AQC116C     0x00F8
 
 /*
  * TERMINOLOGY
@@ -1219,7 +1268,7 @@ typedef struct aq_tx_desc {
 struct aq_txring {
 	struct aq_softc *txr_sc;
 	int txr_index;
-	kmutex_t txr_mutex;
+	struct mtx txr_mutex;
 	bool txr_active;
 	bool txr_stopping;
 	bool txr_sending;
@@ -1245,7 +1294,7 @@ struct aq_txring {
 struct aq_rxring {
 	struct aq_softc *rxr_sc;
 	int rxr_index;
-	kmutex_t rxr_mutex;
+	struct mtx rxr_mutex;
 	bool rxr_active;
 	bool rxr_discarding;
 	bool rxr_stopping;
@@ -1337,7 +1386,7 @@ struct aq_softc {
 	envsys_data_t sc_sensor_temp;
 #endif
 
-	callout_t sc_tick_ch;
+	struct callout sc_tick_ch;
 
 	int sc_nintrs;
 	bool sc_msix;
@@ -1352,8 +1401,8 @@ struct aq_softc {
 	uint16_t sc_product;
 	uint16_t sc_revision;
 
-	kmutex_t sc_mutex;
-	kmutex_t sc_mpi_mutex;
+	struct mtx sc_mutex;
+	struct mtx sc_mpi_mutex;
 
 	const struct aq_firmware_ops *sc_fw_ops;
 	uint64_t sc_fw_caps;			/* AQ1 */
@@ -1573,8 +1622,8 @@ CFATTACH_DECL3_NEW(aq, sizeof(struct aq_softc),
     aq_match, aq_attach, aq_detach, NULL, NULL, NULL, DVF_DETACH_SHUTDOWN);
 
 static const struct aq_product {
-	pci_vendor_id_t aq_vendor;
-	pci_product_id_t aq_product;
+	uint16_t aq_vendor;
+	uint16_t aq_product;
 	const char *aq_name;
 	enum aq_hwtype aq_hwtype;
 	enum aq_media_type aq_media_type;
